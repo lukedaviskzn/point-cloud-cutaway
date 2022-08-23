@@ -1,6 +1,8 @@
 #[macro_use] extern crate glium;
 #[macro_use] extern crate maplit;
 
+use std::{sync::mpsc, thread};
+
 use glium::{glutin::{self, event::{VirtualKeyCode, MouseButton, ElementState}, dpi::PhysicalPosition}, Surface, program::ProgramCreationInput};
 use las::{Reader, Read};
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
@@ -46,61 +48,60 @@ fn main() {
 
     let mut keyboard = KeyboardManager::new();
 
-    // let vertex1 = Vertex { position: [-0.5, -0.5, 0.0], size: 10.0 };
-    // let vertex2 = Vertex { position: [ 0.0,  0.5, 0.0], size: 10.0 };
-    // let vertex3 = Vertex { position: [ 0.5, -0.25, 0.0], size: 10.0 };
-    // let shape = vec![vertex1, vertex2, vertex3];
     let filename = "data/autzen.laz";
-    // let filename = "data/1.2_3.las";
-    // let filename = "data/20181226_VA_Fairfax_County_e1600n1913.laz";
-    
+        
+    let mut shape = vec![];
+
+    let (tx, rx) = mpsc::channel();
+
     let mut reader = Reader::from_path(filename).unwrap();
     
-    let mut shape = vec![];
-    
-    let mut i = 0;
-    // let mut totals = [0.0, 0.0, 0.0];
-
-    // let n = 10_000_000;
     let n = reader.header().number_of_points();
+    
+    thread::spawn(move || {
+        let mut i = 0;
 
-    println!("Loading {} points", n);
+        println!("Loading {} points", n);
 
-    let mut last_progress = 0;
+        let mut last_progress = 0;
 
-    while let Some(Ok(point)) = reader.read() {
-        let colour = if let Some(colour) = point.color {
-            [colour.red as f32 / 255.0, colour.green as f32 / 255.0, colour.blue as f32 / 255.0]
-        } else {
-            [1.0, 1.0, 1.0]
-        };
+        while let Some(Ok(point)) = reader.read() {
+            let colour = if let Some(colour) = point.color {
+                [colour.red as f32 / 255.0, colour.green as f32 / 255.0, colour.blue as f32 / 255.0]
+            } else {
+                [1.0, 1.0, 1.0]
+            };
 
-        let v = Vertex {
-            position: [point.x as f32, point.y as f32, point.z as f32],
-            colour: colour,
-            size: 10.0,
-        };
+            let v = Vertex {
+                position: [point.x as f32, point.y as f32, point.z as f32],
+                colour: colour,
+                size: 10.0,
+            };
 
-        // totals[0] += v.position[0];
-        // totals[1] += v.position[1];
-        // totals[2] += v.position[2];
+            tx.send(v).unwrap();
 
-        shape.push(v);
+            i += 1;
 
-        i += 1;
+            if i > n {
+                break;
+            }
 
-        if i > n {
-            break;
+            let progress = (100 * i) / n; // percentage
+            if progress != last_progress {
+                last_progress = progress;
+                println!("Loading... {}%", progress);
+            }
         }
 
-        if (100 * i) / n != last_progress {
-            last_progress = (100 * i) / n;
-            println!("Loading... {}%", last_progress);
-            // println!("Position: {:?}, Colour: {:?}", v.position, v.colour);
-        }
+        println!("Points Loaded");
+    });
+
+    let num_first_points = n * 5 / 100;
+
+    // Wait for first 5% of points
+    for _ in 0..num_first_points {
+        shape.push(rx.recv().unwrap());
     }
-
-    println!("Points Loaded");
 
     // Calculating totals
     let centre = shape.par_iter()
@@ -110,9 +111,10 @@ fn main() {
             |x, y| [x[0]+y[0], x[1]+y[1], x[2]+y[2]],
         );
     
-    let centre = glam::vec3(centre[0], centre[1], centre[2]) / n as f32;
+    // Calculate centre
+    let centre = glam::vec3(centre[0], centre[1], centre[2]) / num_first_points as f32;
 
-    let vertex_buffer = glium::VertexBuffer::new(&display, &shape).unwrap();
+    let mut vertex_buffer = glium::VertexBuffer::new(&display, &shape).unwrap();
     let indices = glium::index::NoIndices(glium::index::PrimitiveType::Points);
 
     let vertex_shader_src = include_str!("shaders/main.vert");
@@ -190,6 +192,16 @@ fn main() {
 
         // Handle Update
         {
+            let mut changed = false;
+            // Get any newly available points
+            while let Ok(point) = rx.try_recv() {
+                shape.push(point);
+                changed = true;
+            }
+            if changed {
+                vertex_buffer = glium::VertexBuffer::new(&display, &shape).unwrap();
+            }
+
             let (width, height) = target.get_dimensions();
             let window_centre = glam::vec2(width as f32 / 2.0, height as f32 / 2.0);
             
