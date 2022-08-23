@@ -1,6 +1,5 @@
 #[macro_use] extern crate glium;
 #[macro_use] extern crate maplit;
-#[macro_use] extern crate clap;
 
 use std::{sync::mpsc, thread};
 
@@ -24,6 +23,8 @@ struct Vertex {
 struct Args {
     #[clap(short, long, value_parser)]
     file: String,
+    #[clap(short, long, value_parser, default_value_t = 10.0)]
+    point_size: f32
 }
 
 const FPS: f32 = 60.0;
@@ -32,6 +33,7 @@ const FRAME_LENGTH: f32 = 1.0/FPS;
 fn main() {
     let args = Args::parse();
     let filename = args.file;
+    let default_point_size = args.point_size;
 
     let event_loop = glutin::event_loop::EventLoop::new();
     let wb = glutin::window::WindowBuilder::new();
@@ -86,7 +88,7 @@ fn main() {
             let v = Vertex {
                 position: [point.x as f32, point.y as f32, point.z as f32],
                 colour: colour,
-                size: 10.0,
+                size: default_point_size,
             };
 
             tx.send(v).unwrap();
