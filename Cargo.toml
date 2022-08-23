@@ -12,3 +12,4 @@ las = { version = "0.7", features = ["laz"] }
 glam = "0.21"
 maplit = "1.0.2"
 rayon = "1.5.3"
+clap = { version = "3.2.17", features = ["derive"] }

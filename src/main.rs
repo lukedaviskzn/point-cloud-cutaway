@@ -1,11 +1,13 @@
 #[macro_use] extern crate glium;
 #[macro_use] extern crate maplit;
+#[macro_use] extern crate clap;
 
 use std::{sync::mpsc, thread};
 
 use glium::{glutin::{self, event::{VirtualKeyCode, MouseButton, ElementState}, dpi::PhysicalPosition}, Surface, program::ProgramCreationInput};
 use las::{Reader, Read};
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+use clap::Parser;
 
 use crate::input::KeyboardManager;
 
@@ -18,10 +20,19 @@ struct Vertex {
     size: f32,
 }
 
+#[derive(Parser, Debug)]
+struct Args {
+    #[clap(short, long, value_parser)]
+    file: String,
+}
+
 const FPS: f32 = 60.0;
 const FRAME_LENGTH: f32 = 1.0/FPS;
 
 fn main() {
+    let args = Args::parse();
+    let filename = args.file;
+
     let event_loop = glutin::event_loop::EventLoop::new();
     let wb = glutin::window::WindowBuilder::new();
     let cb = glutin::ContextBuilder::new()
@@ -48,14 +59,14 @@ fn main() {
 
     let mut keyboard = KeyboardManager::new();
 
-    let filename = "data/autzen.laz";
+    // let filename = "data/autzen.laz";
         
     let mut shape = vec![];
 
     let (tx, rx) = mpsc::channel();
 
     let mut reader = Reader::from_path(filename).unwrap();
-    
+
     let n = reader.header().number_of_points();
     
     thread::spawn(move || {
