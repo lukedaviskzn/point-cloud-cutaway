@@ -6,16 +6,19 @@ in float size;
 
 out vec3 v_colour;
 
-// uniform mat4 mvp;
-uniform mat4 u_model;
-uniform mat4 u_view;
-uniform mat4 u_perspective;
+uniform mat4 u_modelview;
+uniform mat4 u_projection;
+uniform uint u_window_height;
+uniform float u_fovy;
 
 void main() {
     v_colour = colour;
-    vec4 pos = u_view * u_model * vec4(position, 1.0);
+
+    vec4 pos = u_modelview * vec4(position, 1.0);
     
-    // gl_Position = mvp * vec4(position, 1.0);
-    gl_Position = u_perspective * pos;
-    gl_PointSize = size / length(vec3(pos)) * 200;
+    gl_Position = u_projection * pos;
+    gl_PointSize = 1;
+    // h = window height, d = size, z = dist to camera
+    // s = 2*h*arctan(d/2z) / fovy ~= h*d/(z*fovy)
+    gl_PointSize = u_window_height*size/(pos.z*u_fovy);
 }

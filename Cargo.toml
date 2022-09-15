@@ -8,8 +8,9 @@ edition = "2021"
 [dependencies]
 glium = "0.32"
 las = { version = "0.7", features = ["laz"] }
-# nalgebra-glm = "0.17"
 glam = "0.21"
 maplit = "1.0.2"
 rayon = "1.5.3"
 clap = { version = "3.2.17", features = ["derive"] }
+kd-tree = "0.4.2"
+typenum = "1.15.0"
