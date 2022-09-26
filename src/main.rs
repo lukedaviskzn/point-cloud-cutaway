@@ -1,9 +1,9 @@
 #[macro_use] extern crate glium;
 #[macro_use] extern crate maplit;
 
-use std::{sync::mpsc, thread, time::Instant};
+use std::{sync::mpsc::{self, Receiver}, thread, time::Instant, cell::RefCell, borrow::BorrowMut};
 
-use glium::{glutin::{self, event::{VirtualKeyCode, MouseButton, ElementState}, dpi::PhysicalPosition}, Surface, program::ProgramCreationInput};
+use glium::{glutin::{self, event::{VirtualKeyCode, MouseButton, ElementState}, dpi::PhysicalPosition}, Surface, program::ProgramCreationInput, framebuffer::SimpleFrameBuffer};
 use las::{Reader, Read};
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use clap::Parser;
@@ -23,7 +23,7 @@ struct Vertex {
 struct Args {
     #[clap(short, long, value_parser, about)]
     /// Point cloud file path
-    file: String,
+    file: Option<String>,
     #[clap(short, long, value_parser, about, default_value_t = 0.1)]
     /// Base size of the points, in same units as the file
     point_size: f32,
@@ -39,6 +39,8 @@ const BATCH_SIZE: u64 = 500_000;
 const Z_NEAR: f32 = 0.1;
 const Z_FAR: f32 = 1000.0;
 
+const CLEAR_COLOUR: (f32, f32, f32, f32) = (135.0/255.0, 206.0/255.0, 235.0/255.0, 1.0);
+
 fn main() {
     // Profiling
     let server_addr = format!("0.0.0.0:{}", puffin_http::DEFAULT_PORT);
@@ -51,7 +53,7 @@ fn main() {
     // Setup
     let args = Args::parse();
     let filename = args.file;
-    let default_point_size = args.point_size;
+    let mut point_size = args.point_size;
 
     let event_loop = glutin::event_loop::EventLoop::new();
     let wb = glutin::window::WindowBuilder::new()
@@ -91,95 +93,22 @@ fn main() {
 
     // let mut shape = vec![];
 
-    let (tx, rx) = mpsc::channel();
+    let num_points = args.num_points;
+    let mut total_points = 0;
 
-    let mut reader = Reader::from_path(filename).unwrap();
+    let mut centre = None;
+    let mut rx = None;
 
-    // let colour_format_options = ["Solid White", "8-Bit Colour", "16-Bit Colour"];
-    // let mut colour_format: i32 = if reader.header().point_format().has_color {
-    //     2
-    // } else {
-    //     0
-    // };
-    
-    let centre = {
-        let bounds = reader.header().bounds();
+    // Keeps track of loading progress, -1 = no loading happening right now
+    let mut batch_number = -1;
 
-        glam::vec3(
-            (bounds.min.x + bounds.max.x) as f32 / 2.0,
-            (bounds.min.y + bounds.max.y) as f32 / 2.0,
-            (bounds.min.z + bounds.max.z) as f32 / 2.0,
-        )
-    };
-    
-    let total_points = reader.header().number_of_points();
-    let n = if args.num_points == 0 {
-        total_points
-    } else {
-        args.num_points
-    };
-    
-    thread::spawn(move || {
-        puffin::profile_scope!("load_file");
-        // let mut i = 0;
-        let mut points_processed = 0;
-
-        println!("Loading {} of {} points", n, total_points);
-
-        // let mut last_progress = 0;
-
-        let mut batch = vec![];
-
-        while let Some(Ok(point)) = reader.read() {
-            batch.push(point);
-
-            // i += 1;
-            points_processed += 1;
-
-            if points_processed % BATCH_SIZE == 0 {
-                puffin::profile_scope!("send_batch");
-                tx.send(batch).unwrap();
-                batch = vec![];
-            }
-
-            if points_processed > n {
-                tx.send(batch).unwrap();
-                break;
-            }
-            // let progress = (100 * points_processed) / n; // percentage
-            // if progress != last_progress {
-            //     last_progress = progress;
-            //     println!("Loading... {}%", progress);
-            // }
-        }
-
-        println!("Points Loaded");
-    });
-
-    // KdTree
-    // let shape: Vec<_> = {
-    //     print!("Building KdTree... ");
-    //     let kdtree = KdTree::build_by_ordered_float(shape);
-    //     println!("done");
-    //     print!("Calculating Point Sizes... ");
-    //     kdtree.par_iter().map(|p| {
-    //         let nearests = kdtree.nearests(&p.position, 6);
-
-    //         let mut max_sdist = 0.0;
-    //         for v in nearests {
-    //             if v.squared_distance > max_sdist {
-    //                 max_sdist = v.squared_distance * 1.5;
-    //             }
-    //         }
-
-    //         Vertex {
-    //             position: p.position,
-    //             colour: p.colour,
-    //             size: max_sdist.sqrt(),
-    //         }
-    //     }).collect()
-    // };
-    // println!("done");
+    if let Some(filename) = filename {
+        (total_points, centre, rx) = {
+            let (n, c, r) = load_point_cloud(&filename, num_points);
+            (n, Some(c), Some(r))
+        };
+        batch_number = 0;
+    }
 
     let mut vertex_buffers = vec![];
     let indices = glium::index::NoIndices(glium::index::PrimitiveType::Points);
@@ -220,11 +149,17 @@ fn main() {
 
     let mut _frame_counter = 0_u64;
     
-    let mut batch_number = 0;
-
     let mut idle_time = 0.0;
 
     let mut cutaway_queued = false;
+
+    // let mut cutaway_texture = None;
+    // let mut cutaway_slice_texture = None;
+    
+    // let mut cutaway_buffer = None;
+    // let mut cutaway_slice_buffer = None;
+
+    let mut path_rx: Option<Receiver<String>> = None;
     
     event_loop.run(move |event, _, control_flow| {
 
@@ -366,30 +301,51 @@ fn main() {
             // }
             // frame_counter += 1;
 
-            match rx.recv() {
-                Ok(batch) => {
-                    let batch: Vec<_> = batch.par_iter().map(|point| {
-                        let colour = if let Some(colour) = point.color {
-                            [(colour.red / 256) as u8, (colour.green / 256) as u8, (colour.blue / 256) as u8]
-                        } else {
-                            [u8::MAX; 3]
+            if let Some(r) = &path_rx {
+                match r.try_recv() {
+                    Ok(path) => {
+                        (total_points, centre, rx) = {
+                            let (n, c, r) = load_point_cloud(&path, num_points);
+                            (n, Some(c), Some(r))
                         };
-                        
-                        Vertex {
-                            position: [point.x as f32, point.y as f32, point.z as f32],
-                            colour: colour,
-                            // size: default_point_size,
-                        }
-                    }).collect();
-                    // shape.append(&mut batch);
+                        vertex_buffers = vec![];
+                        batch_number = 0;
+                    },
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        path_rx = None;
+                    },
+                    Err(mpsc::TryRecvError::Empty) => {},
+                }
+            }
 
-                    vertex_buffers.push(glium::VertexBuffer::new(&display, &batch).unwrap());
-
-                    batch_number += 1;
-                },
-                Err(_) => {
-                    batch_number = -1;
-                },
+            if let Some(r) = &rx {
+                match r.try_recv() {
+                    Ok(batch) => {
+                        let batch: Vec<_> = batch.par_iter().map(|point| {
+                            let colour = if let Some(colour) = point.color {
+                                [(colour.red / 256) as u8, (colour.green / 256) as u8, (colour.blue / 256) as u8]
+                            } else {
+                                [u8::MAX; 3]
+                            };
+                            
+                            Vertex {
+                                position: [point.x as f32, point.y as f32, point.z as f32],
+                                colour: colour,
+                                // size: point_size,
+                            }
+                        }).collect();
+                        // shape.append(&mut batch);
+    
+                        vertex_buffers.push(glium::VertexBuffer::new(&display, &batch).unwrap());
+    
+                        batch_number += 1;
+                    },
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        batch_number = -1;
+                        rx = None;
+                    },
+                    Err(mpsc::TryRecvError::Empty) => {},
+                }
             }
 
             // Handle movement
@@ -448,11 +404,29 @@ fn main() {
 
                     if batch_number >= 0 {
                         ui.label("Loading Point Cloud File");
-                        ui.add(egui::ProgressBar::new(batch_number as f32 / (n / BATCH_SIZE + 1) as f32).show_percentage());
+                        ui.add(egui::ProgressBar::new(batch_number as f32 / (total_points / BATCH_SIZE + 1) as f32).show_percentage());
                     } else {
+                        if ui.add_enabled(path_rx.is_none(), egui::Button::new("Load Point Cloud")).clicked() {
+                            let channels = mpsc::channel();
+                            path_rx = Some(channels.1);
+                            let tx = channels.0;
+                            
+                            thread::spawn(move || {
+                                if let Some(path) = rfd::FileDialog::new().pick_file() {
+                                    if let Some(path) = path.to_str() {
+                                        tx.send(path.to_owned()).unwrap();
+                                    }
+                                }
+                            });
+                        }
+    
+                        ui.separator();
+                        
                         // ui.add(egui::Slider::new(&mut clipping_dist, 0.4..=1.0).logarithmic(true));
                         ui.checkbox(&mut clipping, "Show Cutaway");
                         ui.small("Use W/S keys to control clipping distance.");
+
+                        ui.add(egui::Slider::new(&mut point_size, 0.001..=20.0).logarithmic(true).text("Point Size"));
                         
                         // egui::ComboBox::from_label("Colour Format")
                         // .selected_text(colour_format_options[colour_format as usize])
@@ -461,6 +435,10 @@ fn main() {
                         //         ui.selectable_value(&mut colour_format, option.0 as i32, *option.1);
                         //     }
                         // });
+
+                        if ui.button("Render").clicked() {
+                            cutaway_queued = true;
+                        }
     
                         ui.separator();
     
@@ -470,14 +448,10 @@ fn main() {
                         });
                     }
 
-                    if ui.button("Render").clicked() {
-                        cutaway_queued = true;
-                    }
-
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                        ui.label(format!("MS: {} ms", delta_t.as_millis()));
-                        ui.label(format!("FPS: {:.2}", 1.0e9 / (delta_t.as_nanos() as f64)));
                         ui.label(format!("Idle: {:.2} ms", idle_time * 1000.0));
+                        ui.label(format!("FPS: {:.2}", 1.0e9 / (delta_t.as_nanos() as f64)));
+                        ui.label(format!("MS: {:.2} ms", delta_t.as_nanos() as f64 / 1.0e6));
                     });
                 });
             });
@@ -487,10 +461,10 @@ fn main() {
             puffin::profile_scope!("render");
             
             // Update camera/matrices
-            let model = coordinate_system_matrix * glam::Mat4::from_translation(-centre);
-            // println!("Model: {}", model);
-            // println!("Camera: {}", camera_position);
+            let model = coordinate_system_matrix * glam::Mat4::from_translation(-centre.unwrap_or(glam::Vec3::ZERO));
             let view = glam::Mat4::from_rotation_translation(glam::Quat::from_euler(glam::EulerRot::YXZ, camera_rotation.x, camera_rotation.y, 0.0), camera_position).inverse();
+            
+            // Perspective
             // let projection = {
             //     let (width, height) = target.get_dimensions();
             //     let aspect = width as f32 / height as f32;
@@ -499,6 +473,7 @@ fn main() {
 
             let zoom = 2.0_f32.powf(-camera_zoom / 10.0);
 
+            // Orthographic
             let projection = {
                 let (width, height) = target.get_dimensions();
                 let (width, height) = (width as f32, height as f32);
@@ -510,75 +485,90 @@ fn main() {
 
             // Render
 
-            let mut target = glium::framebuffer::SimpleFrameBuffer;
+            let mut cutaway_texture = None;
+            let mut cutaway_slice_texture = None;
+            
+            let mut cutaway_buffer: RefCell<Option<SimpleFrameBuffer>> = RefCell::new(None);
+            let mut cutaway_slice_buffer: RefCell<Option<SimpleFrameBuffer>> = RefCell::new(None);
+
+            if cutaway_queued {
+                cutaway_texture = Some(glium::texture::Texture2d::empty_with_format(&display,
+                    glium::texture::UncompressedFloatFormat::U8U8U8,
+                    glium::texture::MipmapsOption::NoMipmap, window_width, window_height).unwrap());
+                cutaway_slice_texture = Some(glium::texture::Texture2d::empty_with_format(&display,
+                    glium::texture::UncompressedFloatFormat::U8,
+                    glium::texture::MipmapsOption::NoMipmap, window_width, window_height).unwrap());
+                
+                if let Some(cutaway_texture) = &cutaway_texture {
+                    cutaway_buffer = RefCell::new(glium::framebuffer::SimpleFrameBuffer::new(&display, cutaway_texture).ok());
+                }
+                if let Some(cutaway_slice_texture) = &cutaway_slice_texture {
+                    cutaway_slice_buffer = RefCell::new(glium::framebuffer::SimpleFrameBuffer::new(&display, cutaway_slice_texture).ok());
+                }
+
+                cutaway_queued = false;
+            }
 
             {
                 puffin::profile_scope!("clear_colour");
                 if show_outline_plane {
                     target.clear_color_and_depth((0.0, 0.0, 0.0, 1.0), 1.0);
                 } else {
-                    target.clear_color_and_depth((135.0/255.0, 206.0/255.0, 235.0/255.0, 1.0), 1.0);
+                    target.clear_color_and_depth(CLEAR_COLOUR, 1.0);
+                }
+
+                if let Some(cutaway_buffer) = &mut *cutaway_buffer.borrow_mut() {
+                    cutaway_buffer.clear_color(CLEAR_COLOUR.0, CLEAR_COLOUR.1, CLEAR_COLOUR.2, CLEAR_COLOUR.3);
+                }
+                if let Some(cutaway_slice_buffer) = &mut *cutaway_slice_buffer.borrow_mut() {
+                    cutaway_slice_buffer.clear_color(0.0, 0.0, 0.0, 0.0);
                 }
             }
             
             {
                 puffin::profile_scope!("queue_points");
                 for vertex_buffer in &vertex_buffers {
-                    target.draw(vertex_buffer, &indices, if show_outline_plane {&debug_program} else {&program}, 
-                        &uniform! {
-                            u_modelview: modelview.to_cols_array_2d(),
-                            u_projection: projection.to_cols_array_2d(),
-                            // u_colour_format: colour_format,
-                            // u_clipping_dist: clipping_dist,
-                            u_clipping: clipping,
-                            u_slice: show_slice,
-                            u_slice_width: 0.000025_f32,
-                            u_zoom: window_width as f32 / zoom,
-                            u_size: default_point_size,
-                        },
-                        &glium::DrawParameters {
-                            depth: glium::Depth {
-                                test: glium::DepthTest::IfLess,
-                                write: true,
-                                ..Default::default()
-                            },
-                            // polygon_mode: glium::PolygonMode::Point,
-                            // multisampling: true,
+                    let p = if show_outline_plane {
+                        &debug_program
+                    } else {
+                        &program
+                    };
+
+                    let uniforms = uniform! {
+                        u_modelview: modelview.to_cols_array_2d(),
+                        u_projection: projection.to_cols_array_2d(),
+                        // u_colour_format: colour_format,
+                        // u_clipping_dist: clipping_dist,
+                        u_clipping: clipping,
+                        u_slice: show_slice,
+                        u_slice_width: 0.000025_f32,
+                        u_zoom: window_width as f32 / zoom,
+                        u_size: point_size,
+                    };
+
+                    let draw_params = glium::DrawParameters {
+                        depth: glium::Depth {
+                            test: glium::DepthTest::IfLess,
+                            write: true,
                             ..Default::default()
-                        }
-                    ).unwrap();
+                        },
+                        // polygon_mode: glium::PolygonMode::Point,
+                        // multisampling: true,
+                        ..Default::default()
+                    };
+                    
+                    target.draw(vertex_buffer, &indices, p, &uniforms, &draw_params).unwrap();
+
+                    if let Some(cutaway_buffer) = &mut *cutaway_buffer.borrow_mut() {
+                        puffin::profile_scope!("draw_render_frame");
+                        cutaway_buffer.draw(vertex_buffer, &indices, &program, &uniforms, &draw_params).unwrap();
+                    }
+                    if let Some(cutaway_slice_buffer) = &mut *cutaway_slice_buffer.borrow_mut() {
+                        puffin::profile_scope!("draw_render_slice");
+                        cutaway_slice_buffer.draw(vertex_buffer, &indices, &debug_program, &uniforms, &draw_params).unwrap();
+                    }
                 }
             }
-            
-
-            // {
-            //     puffin::profile_scope!("Render Slice Buffer");
-            //     for vertex_buffer in &vertex_buffers {
-            //         framebuffer.draw(vertex_buffer, &indices, &debug_program, 
-            //             &uniform! {
-            //                 u_modelview: modelview.to_cols_array_2d(),
-            //                 u_projection: projection.to_cols_array_2d(),
-            //                 u_slice_width: 0.000025_f32,
-            //                 u_zoom: window_width as f32 / zoom,
-            //             },
-            //             &glium::DrawParameters {
-            //                 depth: glium::Depth::default(),
-            //                 // polygon_mode: glium::PolygonMode::Point,
-            //                 // multisampling: true,
-            //                 ..Default::default()
-            //             }
-            //         ).unwrap();
-            //     }
-            // }
-
-            // if show_outline_plane {
-            //     puffin::profile_scope!("Copy Framebuffer");
-            //     target.blit_buffers_from_simple_framebuffer(
-            //         &framebuffer,
-            //         &Rect { left: 0, bottom: 0, width: window_width, height: window_height },
-            //         &BlitTarget { left: 0, bottom: 0, width: window_width as i32, height: window_height as i32 },
-            //         glium::uniforms::MagnifySamplerFilter::Linear, BlitMask::color());
-            // }
 
             {
                 puffin::profile_scope!("queue_gui");
@@ -603,4 +593,78 @@ fn main() {
             while now.elapsed() < duration_left {}
         }
     });
+}
+
+fn load_point_cloud(filename: &str, num_points: u64) -> (u64, glam::Vec3, Receiver<Vec<las::Point>>) {
+    let mut reader = Reader::from_path(filename).unwrap();
+
+    // let colour_format_options = ["Solid White", "8-Bit Colour", "16-Bit Colour"];
+    // let mut colour_format: i32 = if reader.header().point_format().has_color {
+    //     2
+    // } else {
+    //     0
+    // };
+    
+    let centre = {
+        let bounds = reader.header().bounds();
+
+        glam::vec3(
+            (bounds.min.x + bounds.max.x) as f32 / 2.0,
+            (bounds.min.y + bounds.max.y) as f32 / 2.0,
+            (bounds.min.z + bounds.max.z) as f32 / 2.0,
+        )
+    };
+    
+    let total_points = reader.header().number_of_points();
+    let n = if num_points == 0 {
+        total_points
+    } else {
+        num_points
+    };
+    
+    // let mut i = 0;
+    let mut points_processed = 0;
+
+    if n < total_points {
+        println!("Loading {} of {} points", n, total_points);
+    } else {
+        println!("Loading {} points", n);
+    }
+    
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        puffin::profile_scope!("load_file");
+        
+        // let mut last_progress = 0;
+
+        let mut batch = vec![];
+
+        while let Some(Ok(point)) = reader.read() {
+            batch.push(point);
+
+            // i += 1;
+            points_processed += 1;
+
+            if points_processed % BATCH_SIZE == 0 {
+                puffin::profile_scope!("send_batch");
+                tx.send(batch).unwrap();
+                batch = vec![];
+            }
+
+            if points_processed > n {
+                tx.send(batch).unwrap();
+                break;
+            }
+            // let progress = (100 * points_processed) / n; // percentage
+            // if progress != last_progress {
+            //     last_progress = progress;
+            //     println!("Loading... {}%", progress);
+            // }
+        }
+
+        println!("Points Loaded");
+    });
+
+    return (n, centre, rx);
 }

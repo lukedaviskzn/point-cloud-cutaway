@@ -17,9 +17,8 @@ void main() {
     vec4 pos = u_modelview * vec4(position, 1.0);
     
     gl_Position = u_projection * pos;
-    gl_PointSize = 1;
     // h = window height, d = size, z = dist to camera
     // s = 2*h*arctan(d/2z) / fovy ~= h*d/(z*fovy)
     //gl_PointSize = u_window_height*size/(pos.z*u_fovy);
-    gl_PointSize = u_size * u_zoom;
+    gl_PointSize = max(u_size * u_zoom, 1.0);
 }
