@@ -15,5 +15,5 @@ void main() {
     }
     vec2 pos = gl_PointCoord - vec2(0.5);
 
-    color = vec4(1.0, 1.0, 1.0, 0.0);
+    color = vec4(0.0, 0.0, 0.0, 1.0);
 }
