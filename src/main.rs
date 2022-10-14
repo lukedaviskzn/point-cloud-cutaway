@@ -113,6 +113,7 @@ fn main() {
     let mut drawing_mode = false;
 
     let mut active_tool = DrawTool::Pencil;
+    let mut final_render_queued = false;
 
     // let mut cutaway_file = None;
     // let mut cutaway_slice_file = None;
@@ -567,6 +568,7 @@ fn main() {
                     let pencil = egui::RichText::new('\u{f303}'.to_string()).family(egui::FontFamily::Name("icons".into()));
                     let eraser = egui::RichText::new('\u{f12d}'.to_string()).family(egui::FontFamily::Name("icons".into()));
                     let room = egui::RichText::new('\u{f015}'.to_string()).family(egui::FontFamily::Name("icons".into()));
+                    let image = egui::RichText::new('\u{f03e}'.to_string()).family(egui::FontFamily::Name("icons".into()));
                     
                     if ui.button(pencil).clicked() {
                         active_tool = DrawTool::Pencil;
@@ -577,19 +579,23 @@ fn main() {
                     if ui.button(room).clicked() {
                         active_tool = DrawTool::RoomIdentification;
                     }
+                    if ui.button(image).clicked() {
+                        final_render_queued = true;
+                    }
 
-                    ui.label(egui::RichText::new("Room Identification").strong());
-                    ui.colored_label(egui::Color32::RED, "Wall and Floor: Red");
-                    ui.colored_label(egui::Color32::BLUE, "Room and Exterior: Blue");
+                    // ui.label(egui::RichText::new("Room Identification").strong());
+                    // ui.colored_label(egui::Color32::RED, "Wall/Floor: Red");
+                    // ui.colored_label(egui::Color32::BLUE, "Air: Blue");
 
-                    ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                        ui.label(format!("Idle: {:.2} ms", idle_time * 1000.0));
-                        ui.label(format!("FPS: {:.2}", 1.0e9 / (delta_t.as_nanos() as f64)));
-                        ui.label(format!("MS: {:.2} ms", delta_t.as_nanos() as f64 / 1.0e6));
-                    });
+                    // ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                    //     ui.label(format!("Idle: {:.2} ms", idle_time * 1000.0));
+                    //     ui.label(format!("FPS: {:.2}", 1.0e9 / (delta_t.as_nanos() as f64)));
+                    //     ui.label(format!("MS: {:.2} ms", delta_t.as_nanos() as f64 / 1.0e6));
+                    // });
                 });
             });
 
+            // Drawing tools
             if mouse.is_pressed(MouseButton::Left) || mouse.is_pressed(MouseButton::Right) {
                 if let Some(image) = cutaway_slice_processed_image.borrow_mut() {
                     let last_pos = mouse.last_position();
@@ -654,14 +660,6 @@ fn main() {
                                             if point.1 < dimensions.1 - 1 {
                                                 stack.push((point.0, point.1 + 1));
                                             }
-    
-                                            // 1. If node is not Inside return.
-                                            // 2. Set the node
-                                            // 3. Perform Flood-fill one step to the south of node.
-                                            // 4. Perform Flood-fill one step to the north of node
-                                            // 5. Perform Flood-fill one step to the west of node
-                                            // 6. Perform Flood-fill one step to the east of node
-                                            // 7. Return.
                                         }
                                     }
                                 }
@@ -669,6 +667,31 @@ fn main() {
                         }
                     }
                 }
+            }
+
+            // Render final cutaway
+            if final_render_queued {
+                // Check if all pixels have been coloured
+                if let Some(cutaway) = cutaway_image.borrow_mut() {
+                    if let Some(image) = cutaway_slice_processed_image.borrow_mut() {
+                        let mut base = cutaway.clone();
+                        
+                        for (x, y, pixel) in image.enumerate_pixels_mut() {
+                            match *pixel {
+                                image::Rgba([255,0,0,0]) | image::Rgba([0,0,0,255]) => base.put_pixel(x, y, image::Rgba([0,0,0,255])),
+                                _ => {},
+                            };
+                        }
+
+                        if let Some(path) = rfd::FileDialog::new().add_filter("PNG", &["png"]).save_file() {
+                            if let Some(path) = path.to_str() {
+                                base.save(path).unwrap();
+                            }
+                        }
+                    }
+                }
+
+                final_render_queued = false;
             }
 
             mouse.on_new_frame();
