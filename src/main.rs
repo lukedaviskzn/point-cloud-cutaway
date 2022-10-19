@@ -49,13 +49,16 @@ const Z_FAR: f32 = 1000.0;
 const CLEAR_COLOUR: (f32, f32, f32, f32) = (135.0/255.0, 206.0/255.0, 235.0/255.0, 1.0);
 
 fn main() {
-    // Profiling
-    let server_addr = format!("0.0.0.0:{}", puffin_http::DEFAULT_PORT);
-    eprintln!("Serving profile data on {}", server_addr);
 
-    let _puffin_server = puffin_http::Server::new(&server_addr).unwrap();
+    if cfg!(debug_assertions) {
+        // Profiling
+        let server_addr = format!("0.0.0.0:{}", puffin_http::DEFAULT_PORT);
+        eprintln!("Serving profile data on {}", server_addr);
+        
+        let _puffin_server = puffin_http::Server::new(&server_addr).expect("Failed to start profiling server.");
 
-    puffin::set_scopes_on(true);
+        puffin::set_scopes_on(true);
+    }
 
     // Setup
     let args = Args::parse();
@@ -68,7 +71,7 @@ fn main() {
     let cb = glutin::ContextBuilder::new()
         .with_gl_profile(glutin::GlProfile::Core)
         .with_multisampling(4);
-    let display = glium::Display::new(wb, cb, &event_loop).unwrap();
+    let display = glium::Display::new(wb, cb, &event_loop).expect("Failed to create display.");
 
     let mut egui_glium = egui_glium::EguiGlium::new(&display, &event_loop);
 
@@ -120,7 +123,6 @@ fn main() {
     // let mut cutaway_slice_processed_file = None;
 
     let mut cutaway_image: Option<image::ImageBuffer<_, _>> = None;
-    let mut cutaway_slice_image: Option<image::ImageBuffer<_, _>> = None;
     let mut cutaway_slice_processed_image: Option<image::ImageBuffer<_, _>> = None;
 
     // Flip y and z
@@ -147,7 +149,7 @@ fn main() {
 
     if let Some(filename) = filename {
         (total_points, centre, rx) = {
-            let (n, c, r) = load_point_cloud(&filename, num_points);
+            let (n, c, r) = load_point_cloud(&filename, num_points).expect(&format!("Unable to load file {}", filename));
             (n, Some(c), Some(r))
         };
         batch_number = 0;
@@ -170,7 +172,7 @@ fn main() {
             geometry_shader: None,
             transform_feedback_varyings: None,
             outputs_srgb: true,
-        }).unwrap()
+        }).expect("Failed to parse main shader.")
     };
 
     let debug_program = {
@@ -186,7 +188,7 @@ fn main() {
             geometry_shader: None,
             transform_feedback_varyings: None,
             outputs_srgb: true,
-        }).unwrap()
+        }).expect("Failed to parse slice shader.")
     };
 
     let drawing_program = {
@@ -202,7 +204,7 @@ fn main() {
             geometry_shader: None,
             transform_feedback_varyings: None,
             outputs_srgb: true,
-        }).unwrap()
+        }).expect("Failed to parse drawing shader.")
     };
 
     let mut last_time = Instant::now();
@@ -240,7 +242,7 @@ fn main() {
             position: [1.0, -1.0, 0.0],
             colour: [0, 0, 0],
         },
-    ]).unwrap();
+    ]).expect("Failed to create fullscreen quad.");
     
     event_loop.run(move |event, _, control_flow| {
 
@@ -391,12 +393,17 @@ fn main() {
             if let Some(r) = &path_rx {
                 match r.try_recv() {
                     Ok(path) => {
-                        (total_points, centre, rx) = {
-                            let (n, c, r) = load_point_cloud(&path, num_points);
-                            (n, Some(c), Some(r))
-                        };
-                        vertex_buffers = vec![];
-                        batch_number = 0;
+                        let p = load_point_cloud(&path, num_points);
+                        if let Some(p) = p {
+                            (total_points, centre, rx) = {
+                                let (n, c, r) = p;
+                                (n, Some(c), Some(r))
+                            };
+                            vertex_buffers = vec![];
+                            batch_number = 0;
+                        } else {
+                            eprintln!("Failed to load file {}", path);
+                        }
                     },
                     Err(mpsc::TryRecvError::Disconnected) => {
                         path_rx = None;
@@ -423,7 +430,7 @@ fn main() {
                         }).collect();
                         // shape.append(&mut batch);
     
-                        vertex_buffers.push(glium::VertexBuffer::new(&display, &batch).unwrap());
+                        vertex_buffers.push(glium::VertexBuffer::new(&display, &batch).expect("Failed to create point vertex buffer."));
     
                         batch_number += 1;
 
@@ -509,7 +516,7 @@ fn main() {
                             thread::spawn(move || {
                                 if let Some(path) = rfd::FileDialog::new().pick_file() {
                                     if let Some(path) = path.to_str() {
-                                        tx.send(path.to_owned()).unwrap();
+                                        tx.send(path.to_owned()).expect("Failed to send file path to main thread.");
                                     }
                                 }
                             });
@@ -682,10 +689,51 @@ fn main() {
                                 _ => {},
                             };
                         }
+                        
+                        let valid_formats = hashmap! {
+                            "PNG" => vec!["png"],
+                            "JPEG" => vec!["jpeg", "jpg"],
+                            "GIF" => vec!["gif"],
+                            "WebP" => vec!["webp"],
+                            "Tiff" => vec!["tiff"],
+                        };
+                        
+                        let dialog = {
+                            let mut d = rfd::FileDialog::new().set_file_name("output.png");
+                            
+                            for (name, extensions) in &valid_formats {
+                                d = d.add_filter(name, &extensions);
+                            }
+                            
+                            d
+                        };
+                        
+                        if let Some(mut path) = dialog.save_file() {
+                            let mut valid = false;
+                            
+                            if path.extension().is_some() {
+                                for (_, extensions) in valid_formats {
+                                    for extention in extensions {
+                                        if path.extension().expect("No file extension (this shouldn't ever occur)").to_ascii_lowercase() == extention {
+                                            valid = true;
+                                            break;
+                                        }
+                                    }
+                                    if valid {
+                                        break;
+                                    }
+                                }
+                            }
 
-                        if let Some(path) = rfd::FileDialog::new().add_filter("PNG", &["png"]).save_file() {
+                            if !valid {
+                                path.set_extension("png"); // force png if no extension chosen
+                            }
+                            
                             if let Some(path) = path.to_str() {
-                                base.save(path).unwrap();
+                                match base.save(path) {
+                                    Ok(_) => {},
+                                    Err(err) => eprintln!("{}", err),
+                                }
                             }
                         }
                     }
@@ -735,12 +783,12 @@ fn main() {
             if cutaway_queued {
                 cutaway_texture = Some(glium::texture::Texture2d::empty_with_format(&display,
                     glium::texture::UncompressedFloatFormat::U8U8U8U8,
-                    glium::texture::MipmapsOption::NoMipmap, window_width, window_height).unwrap());
+                    glium::texture::MipmapsOption::NoMipmap, window_width, window_height).expect("Failed to create cutaway texture"));
                 cutaway_slice_texture = Some(glium::texture::Texture2d::empty_with_format(&display,
                     glium::texture::UncompressedFloatFormat::U8U8U8U8,
-                    glium::texture::MipmapsOption::NoMipmap, window_width, window_height).unwrap());
+                    glium::texture::MipmapsOption::NoMipmap, window_width, window_height).expect("Failed to create cutaway slice texture"));
                 _cutaway_depth = Some(glium::framebuffer::DepthRenderBuffer::new(&display, 
-                    glium::texture::DepthFormat::F32, window_width, window_height).unwrap());
+                    glium::texture::DepthFormat::F32, window_width, window_height).expect("Failed to create processed cutaway slice texture"));
                 
                 if let Some(cutaway_texture) = &cutaway_texture {
                     if let Some(cutaway_depth) = &_cutaway_depth {
@@ -800,33 +848,33 @@ fn main() {
                         ..Default::default()
                     };
                     
-                    target.draw(vertex_buffer, &indices, p, &uniforms, &draw_params).unwrap();
+                    target.draw(vertex_buffer, &indices, p, &uniforms, &draw_params).expect("Failed to draw to screen.");
 
                     if let Some(cutaway_buffer) = &mut *cutaway_buffer.borrow_mut() {
                         puffin::profile_scope!("draw_render_frame");
-                        cutaway_buffer.draw(vertex_buffer, &indices, &program, &uniforms, &draw_params).unwrap();
+                        cutaway_buffer.draw(vertex_buffer, &indices, &program, &uniforms, &draw_params).expect("Failed to draw to cutaway buffer.");
                     }
                     if let Some(cutaway_slice_buffer) = &mut *cutaway_slice_buffer.borrow_mut() {
                         puffin::profile_scope!("draw_render_slice");
-                        cutaway_slice_buffer.draw(vertex_buffer, &indices, &debug_program, &uniforms, &Default::default()).unwrap();
+                        cutaway_slice_buffer.draw(vertex_buffer, &indices, &debug_program, &uniforms, &Default::default()).expect("Failed to draw to cutaway slice buffer.");
                     }
                 }
             } else {
                 let cutaway_texture = {
-                    let image = cutaway_image.as_ref().unwrap();
+                    let image = cutaway_image.as_ref().expect("Failed to fetch cutaway image from memory");
                     let data: Vec<u8> = image.to_vec();
                     let dimensions = image.dimensions();
                     let raw = glium::texture::RawImage2d::from_raw_rgba_reversed(&data, dimensions);
 
-                    glium::texture::Texture2d::new(&display, raw).unwrap()
+                    glium::texture::Texture2d::new(&display, raw).expect("Failed to create cutaway texture")
                 };
                 let cutaway_slice_texture = {
-                    let image = cutaway_slice_processed_image.as_ref().unwrap();
+                    let image = cutaway_slice_processed_image.as_ref().expect("Failed to fetch cutaway slice image from memory");
                     let data: Vec<u8> = image.to_vec();
                     let dimensions = image.dimensions();
                     let raw = glium::texture::RawImage2d::from_raw_rgba_reversed(&data, dimensions);
 
-                    glium::texture::Texture2d::new(&display, raw).unwrap()
+                    glium::texture::Texture2d::new(&display, raw).expect("Failed to create cutaway slice texture")
                 };
 
                 target.draw(&fullscreen_quad, &quad_indices, &drawing_program, 
@@ -837,7 +885,7 @@ fn main() {
                     &glium::DrawParameters {
                     backface_culling: glium::BackfaceCullingMode::CullingDisabled,
                     ..Default::default()
-                }).unwrap();
+                }).expect("Failed to draw to cutaway image screen");
             }
 
             {
@@ -847,33 +895,21 @@ fn main() {
             
             {
                 puffin::profile_scope!("finish_frame");
-                target.finish().unwrap();
+                target.finish().expect("Failed to finish frame");
             }
 
             // Process cutaway
             if let Some(cutaway_texture) = cutaway_texture {
                 let cutaway: glium::texture::RawImage2d<_> = cutaway_texture.read();
-                let mut image = image::RgbaImage::from_raw(cutaway.width, cutaway.height, (*cutaway.data).to_vec()).unwrap();
+                let mut image = image::RgbaImage::from_raw(cutaway.width, cutaway.height, (*cutaway.data).to_vec()).expect("Failed to parse cutaway texture");
                 image::imageops::flip_vertical_in_place(&mut image);
-
-                // let dir = tempfile::tempdir().unwrap();
-
-                // eprintln!("Saving cutaway layers to {}", dir.path().display());
-
-                // cutaway_file = Some(dir.path().join("cutaway0.png"));
-                // image.save(cutaway_file.as_ref().unwrap()).unwrap();
 
                 cutaway_image = Some(image);
             
                 if let Some(cutaway_slice_texture) = cutaway_slice_texture {
                     let cutaway_slice: glium::texture::RawImage2d<_> = cutaway_slice_texture.read();
-                    let mut image = image::RgbaImage::from_raw(cutaway_slice.width, cutaway_slice.height, (*cutaway_slice.data).to_vec()).unwrap();
+                    let mut image = image::RgbaImage::from_raw(cutaway_slice.width, cutaway_slice.height, (*cutaway_slice.data).to_vec()).expect("Failed to parse cutaway slice texture");
                     image::imageops::flip_vertical_in_place(&mut image);
-                    
-                    // cutaway_slice_file = Some(dir.path().join("cutaway1_unprocessed.png"));
-                    // image.save(cutaway_slice_file.as_ref().unwrap()).unwrap();
-
-                    cutaway_slice_image = Some(image.clone());
                     
                     let mut points = vec![];
 
@@ -895,14 +931,9 @@ fn main() {
                         }
                     }
                     
-                    // cutaway_slice_processed_file = Some(dir.path().join("cutaway1.png"));
-                    // image.save(cutaway_slice_processed_file.as_ref().unwrap()).unwrap();
-
                     cutaway_slice_processed_image = Some(image);
 
                     drawing_mode = true;
-
-                    // image.save("output/cutaway_slice_processed.png").unwrap();
                 }
             }
         }
@@ -923,8 +954,13 @@ fn main() {
     });
 }
 
-fn load_point_cloud(filename: &str, num_points: u64) -> (u64, glam::Vec3, Receiver<Vec<las::Point>>) {
-    let mut reader = Reader::from_path(filename).unwrap();
+fn load_point_cloud(filename: &str, num_points: u64) -> Option<(u64, glam::Vec3, Receiver<Vec<las::Point>>)> {
+    let mut reader = {
+        match Reader::from_path(filename) {
+            Ok(reader) => reader,
+            Err(_) => return None,
+        }
+    };
 
     // let colour_format_options = ["Solid White", "8-Bit Colour", "16-Bit Colour"];
     // let mut colour_format: i32 = if reader.header().point_format().has_color {
@@ -977,26 +1013,20 @@ fn load_point_cloud(filename: &str, num_points: u64) -> (u64, glam::Vec3, Receiv
 
             if points_processed % BATCH_SIZE == 0 {
                 puffin::profile_scope!("send_batch");
-                tx.send(batch).unwrap();
+                tx.send(batch).expect("Failed to send point batch to main thread.");
                 batch = vec![];
                 batch_number += 1;
                 println!("Loaded Batch {}/{}", batch_number, n / BATCH_SIZE + 1);
             }
 
             if points_processed > n {
-                tx.send(batch).unwrap();
-                batch = vec![];
+                tx.send(batch).expect("Failed to send final point batch to main thread.");
                 break;
             }
-            // let progress = (100 * points_processed) / n; // percentage
-            // if progress != last_progress {
-            //     last_progress = progress;
-            //     println!("Loading... {}%", progress);
-            // }
         }
 
         println!("Points Loaded");
     });
 
-    return (n, centre, rx);
+    return Some((n, centre, rx));
 }
