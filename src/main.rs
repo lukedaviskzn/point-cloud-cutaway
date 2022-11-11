@@ -376,6 +376,31 @@ fn main() {
         let now = Instant::now();
         let delta_t = now - last_time;
         last_time = now;
+
+        // Drawing mode matrix, used in update, and render functions
+        let drawing_mvp = {
+            let dimensions = if cutaway_image.as_ref().is_some() {
+                cutaway_image.as_ref().expect("Failed to fetch cutaway image from memory").dimensions()
+            } else {
+                (1, 1)
+            };
+            
+            let cutaway_aspect = dimensions.1 as f32 / dimensions.0 as f32;
+            let aspect = window_height as f32 / window_width as f32;
+            
+            let width = 0.75;
+            let width = if width * cutaway_aspect > 0.9 * aspect {
+                0.9 * aspect / cutaway_aspect
+            } else {
+                width
+            };
+            
+            let model = glam::Mat4::from_scale_rotation_translation(glam::vec3(width, width * cutaway_aspect, 1.0), glam::Quat::IDENTITY, glam::vec3(0.15, 0.0, 0.0));
+            let view = glam::Mat4::IDENTITY;
+            let perspective = glam::Mat4::orthographic_lh(-1.0, 1.0, -1.0 * aspect, 1.0 * aspect, -1.0, 1.0);
+            
+            perspective * view * model
+        };
         
         // Handle Update
         if !drawing_mode {
@@ -571,12 +596,17 @@ fn main() {
 
             egui_glium.run(&display, |egui_ctx| {
                 puffin::profile_scope!("update_gui");
-                egui::SidePanel::left("my_side_panel").show(egui_ctx, |ui| {
+                egui::SidePanel::left("my_side_panel").max_width(64.0).show(egui_ctx, |ui| {
+                    let back = egui::RichText::new('\u{f060}'.to_string()).family(egui::FontFamily::Name("icons".into()));
                     let pencil = egui::RichText::new('\u{f303}'.to_string()).family(egui::FontFamily::Name("icons".into()));
                     let eraser = egui::RichText::new('\u{f12d}'.to_string()).family(egui::FontFamily::Name("icons".into()));
                     let room = egui::RichText::new('\u{f015}'.to_string()).family(egui::FontFamily::Name("icons".into()));
                     let image = egui::RichText::new('\u{f03e}'.to_string()).family(egui::FontFamily::Name("icons".into()));
                     
+                    if ui.button(back).clicked() {
+                        drawing_mode = false;
+                        
+                    }
                     if ui.button(pencil).clicked() {
                         active_tool = DrawTool::Pencil;
                     }
@@ -605,10 +635,31 @@ fn main() {
             // Drawing tools
             if mouse.is_pressed(MouseButton::Left) || mouse.is_pressed(MouseButton::Right) {
                 if let Some(image) = cutaway_slice_processed_image.borrow_mut() {
-                    let last_pos = mouse.last_position();
-                    let pos = mouse.position();
+                    let last_pos = {
+                        let window_size = glam::vec2(window_width as f32, window_height as f32);
+                        let mpos = mouse.last_position() / window_size * 2.0 + glam::vec2(-1.0, -1.0);
+                        
+                        let p = drawing_mvp.inverse() * glam::vec4(mpos.x, mpos.y, 0.0, 1.0) / 2.0 + glam::vec4(0.5, 0.5, 1.0, 1.0);
+
+                        glam::vec2(p.x, p.y) * window_size
+                    };
+                    let pos = {
+                        let window_size = glam::vec2(window_width as f32, window_height as f32);
+                        let mpos = mouse.position() / window_size * 2.0 + glam::vec2(-1.0, -1.0);
+                        
+                        let p = drawing_mvp.inverse() * glam::vec4(mpos.x, mpos.y, 0.0, 1.0) / 2.0 + glam::vec4(0.5, 0.5, 1.0, 1.0);
+
+                        glam::vec2(p.x, p.y) * window_size
+                    };
                     
                     for (lx, ly) in line_drawing::Bresenham::new((last_pos.x as i32, last_pos.y as i32), (pos.x as i32, pos.y as i32)) {
+                        let lx = lx as u32;
+                        let ly = ly as u32;
+                        
+                        if !(0..image.width()).contains(&lx) || !(0..image.height()).contains(&ly) {
+                            continue;
+                        }
+                        
                         match active_tool {
                             DrawTool::Pencil => {
                                 image.put_pixel(lx as u32, ly as u32, image::Rgba([0, 0, 0, 255]));
@@ -617,7 +668,14 @@ fn main() {
                                 for cy in (ly - 5)..(ly + 5) {
                                     for cx in (lx - 5)..(lx + 5) {
                                         if (cx-lx)*(cx-lx) + (cy-ly)*(cy-ly) <= 5*5 {
-                                            image.put_pixel(cx as u32, cy as u32, image::Rgba([255, 255, 255, 0]));
+                                            let cx = cx as u32;
+                                            let cy = cy as u32;
+                                            
+                                            if !(0..image.width()).contains(&cx) || !(0..image.height()).contains(&cy) {
+                                                continue;
+                                            }
+                                            
+                                            image.put_pixel(cx, cy, image::Rgba([255, 255, 255, 0]));
                                         }
                                     }
                                 }
@@ -633,10 +691,7 @@ fn main() {
                                         image::Rgba([255, 0, 0, 0])
                                     };
                                     
-                                    let start_pos = {
-                                        let pos = mouse.position();
-                                        (pos.x as u32, pos.y as u32)
-                                    };
+                                    let start_pos = (pos.x as u32, pos.y as u32);
                                     
                                     // Cannot be black or same as target
                                     let start_colour = *image.get_pixel(start_pos.0, start_pos.1);
@@ -881,6 +936,7 @@ fn main() {
                     &uniform! {
                         u_cutaway: cutaway_texture,
                         u_cutaway_slice: cutaway_slice_texture,
+                        u_mvp: drawing_mvp.to_cols_array_2d(),
                     }, 
                     &glium::DrawParameters {
                     backface_culling: glium::BackfaceCullingMode::CullingDisabled,
